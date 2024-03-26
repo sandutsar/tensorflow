@@ -163,30 +163,23 @@ ENTRY e {
   EXPECT_FALSE(GemmFusion(gpu_version_).Run(module.get()).value());
 }
 
-TEST_F(GemmFusionTest, DoNotTriggerWhenTheLhsNoncontractingDimIs1) {
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
-                          ParseAndReturnVerifiedModule(R"(
-ENTRY e {
-  p0 = s8[1,256] parameter(0)
-  p0c = f16[1,256] convert(p0)
-  p1 = f16[256,512] parameter(1)
-  ROOT r = f16[1,512] dot(p0c, p1),
-    lhs_contracting_dims={1}, rhs_contracting_dims={0}
-})"));
-  EXPECT_FALSE(GemmFusion(gpu_version_).Run(module.get()).value());
-}
+TEST_F(GemmFusionTest, FuseDotWithTrivialNoncontractingDim) {
+  auto module = ParseAndReturnVerifiedModule(R"(
+HloModule m
 
-TEST_F(GemmFusionTest, DoNotTriggerWhenTheRhsNoncontractingDimIs1) {
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
-                          ParseAndReturnVerifiedModule(R"(
 ENTRY e {
-  p0 = s8[128,256] parameter(0)
-  p0c = f16[128,256] convert(p0)
-  p1 = f16[256,1] parameter(1)
-  ROOT r = f16[128,1] dot(p0c, p1),
-    lhs_contracting_dims={1}, rhs_contracting_dims={0}
-})"));
-  EXPECT_FALSE(GemmFusion(gpu_version_).Run(module.get()).value());
+  p0 = s8[60,5] parameter(0)
+  r0 = s8[3,20,5] reshape(p0)
+  c0 = f16[3,20,5] convert(r0)
+  p1 = f16[3,1,20] parameter(1)
+  ROOT d = f16[3,5,1] dot(c0, p1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={2},
+    lhs_batch_dims={0}, rhs_batch_dims={0}
+})")
+                    .value();
+  EXPECT_TRUE(GemmFusion(gpu_version_).Run(module.get()).value());
+  EXPECT_THAT(module->entry_computation()->root_instruction(),
+              GmockMatch(m::Fusion(m::Parameter(), m::Parameter())));
 }
 
 TEST_F(GemmFusionTest, HandleDotIfCublasRequiresPadding) {
@@ -1146,6 +1139,63 @@ ENTRY e {
 ; CHECK:        kind=kCustom
 ; CHECK:        __triton_gemm
 })");
+}
+
+class SparseDotTest : public GemmFusionTest {};
+
+TEST_F(SparseDotTest, DotWithSparseLhsOperandIsRewritten) {
+  auto module = ParseAndReturnVerifiedModule(R"(
+HloModule test
+ENTRY main {
+  lhs = f16[2,16] parameter(0)
+  rhs = f16[32,2] parameter(1)
+  meta = u16[2,2] parameter(2)
+  ROOT dot = f32[2,2] dot(lhs, rhs, meta),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}, sparsity=L.1@2:4
+})")
+                    .value();
+  EXPECT_TRUE(GemmFusion(gpu_version_).Run(module.get()).value());
+
+  MatchHloModule(*module, R"(
+; CHECK-LABEL: ENTRY %main ({{.*}}: f16[2,16], {{.*}}: f16[32,2], {{.*}}: u16[2,2]) -> f32[2,2] {
+; CHECK-NEXT: [[P0:%[^ ]+]] = f16[2,16]{1,0} parameter(0)
+; CHECK-NEXT: [[P1:%[^ ]+]] = f16[32,2]{1,0} parameter(1)
+; CHECK-NEXT: [[META:%[^ ]+]] = u16[2,2]{1,0} parameter(2)
+; CHECK:      ROOT {{.*}} = f32[2,2]{1,0}
+; CHECK-SAME:   fusion(f16[2,16]{1,0} [[P0]], f16[32,2]{1,0} [[P1]], u16[2,2]{1,0} [[META]]),
+; CHECK-SAME:   kind=kCustom
+; CHECK-SAME:   __triton_gemm
+})");
+}
+
+TEST_F(SparseDotTest, DotWithSparseRhsOperandIsNotSupported) {
+  auto module = ParseAndReturnVerifiedModule(R"(
+HloModule test
+ENTRY main {
+  lhs = f16[2,32] parameter(0)
+  rhs = f16[16,2] parameter(1)
+  meta = u16[2,2] parameter(2)
+  ROOT dot = f32[2,2] dot(lhs, rhs, meta),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}, sparsity=R.0@2:4
+})")
+                    .value();
+  auto result = GemmFusion(gpu_version_).Run(module.get());
+  EXPECT_FALSE(result.ok());
+}
+
+TEST_F(SparseDotTest, UnsupportedSparsityType) {
+  auto module = ParseAndReturnVerifiedModule(R"(
+HloModule test
+ENTRY main {
+  lhs = f16[2,8] parameter(0)
+  rhs = f16[32,2] parameter(1)
+  meta = u16[2,1] parameter(2)
+  ROOT dot = f32[2,2] dot(lhs, rhs, meta),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}, sparsity=L.1@1:4
+})")
+                    .value();
+  auto result = GemmFusion(gpu_version_).Run(module.get());
+  EXPECT_FALSE(result.ok());
 }
 
 }  // namespace
